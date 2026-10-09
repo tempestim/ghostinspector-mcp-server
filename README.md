@@ -40,7 +40,13 @@ You can find your API key at: https://app.ghostinspector.com/account
 
 ### Claude Code Configuration
 
-Add the server to your Claude Code MCP settings. Edit your `~/.claude/claude_desktop_config.json` (or the appropriate config file):
+```bash
+claude mcp add ghostinspector --scope user \
+  -e GHOST_INSPECTOR_API_KEY=your_api_key_here \
+  -- uv run --directory /path/to/ghostinspector-mcp-server ghostinspector-mcp
+```
+
+Or add it to an MCP config file (e.g. Claude Desktop's `claude_desktop_config.json`):
 
 ```json
 {
@@ -55,7 +61,7 @@ Add the server to your Claude Code MCP settings. Edit your `~/.claude/claude_des
 }
 ```
 
-Or if using uv:
+Or, without installing it first, via uv:
 
 ```json
 {
@@ -121,6 +127,10 @@ Or if using uv:
 | Tool | Description |
 |------|-------------|
 | `get_running_tests` | Get currently running tests for an organization |
+
+Tools are annotated as read-only, write (execute/create), or destructive (cancel) so clients can decide which need confirmation.
+
+Executing a test or suite without `immediate` waits for it to finish (up to 15 minutes). For long suites, pass `immediate=True` and check the result with `get_suite_result`.
 
 ## Usage Examples
 
@@ -203,7 +213,7 @@ Create a test in suite abc123 called "Login Test" that:
 cd ghostinspector-mcp-server
 
 # Install dependencies
-uv pip install -e ".[dev]"
+uv venv && uv pip install -e ".[dev]"
 ```
 
 ### Running Tests
@@ -215,8 +225,8 @@ pytest
 ### Code Formatting
 
 ```bash
-black src/
-ruff check src/
+ruff format src tests
+ruff check src tests
 ```
 
 ## License

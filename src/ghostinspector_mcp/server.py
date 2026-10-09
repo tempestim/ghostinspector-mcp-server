@@ -2,14 +2,21 @@
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.types import ToolAnnotations
 
-from .client import GhostInspectorClient
+from .client import GhostInspectorClient, GhostInspectorError
 
 # Initialize the MCP server
-mcp = FastMCP("ghostinspector")
+mcp = MCPServer("ghostinspector")
+
+READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+# Runs or creates tests: changes state, but never deletes anything.
+WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True)
+CANCEL = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
 
 # Global client instance
 _client: Optional[GhostInspectorClient] = None
@@ -21,7 +28,7 @@ def get_client() -> GhostInspectorClient:
     if _client is None:
         api_key = os.environ.get("GHOST_INSPECTOR_API_KEY")
         if not api_key:
-            raise ValueError(
+            raise GhostInspectorError(
                 "GHOST_INSPECTOR_API_KEY environment variable is required. "
                 "Get your API key from https://app.ghostinspector.com/account"
             )
@@ -37,7 +44,7 @@ def format_response(data: Any) -> str:
 # ==================== Organization & Hierarchy Tools ====================
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def get_hierarchy() -> str:
     """Get the complete organizational hierarchy of folders, suites, and tests.
 
@@ -55,8 +62,7 @@ def get_hierarchy() -> str:
 
     # Build folder lookup
     folder_map = {
-        f.get("_id"): {"_id": f.get("_id"), "name": f.get("name"), "suites": []}
-        for f in folders
+        f.get("_id"): {"_id": f.get("_id"), "name": f.get("name"), "suites": []} for f in folders
     }
 
     unorganized = []
@@ -80,7 +86,7 @@ def get_hierarchy() -> str:
     return format_response(result)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def list_modules() -> str:
     """List reusable test modules in your Ghost Inspector account.
 
@@ -99,16 +105,16 @@ def list_modules() -> str:
     for t in tests:
         if t.get("importOnly") is True:
             suite_name = (
-                t.get("suite", {}).get("name")
-                if isinstance(t.get("suite"), dict)
-                else "Unknown"
+                t.get("suite", {}).get("name") if isinstance(t.get("suite"), dict) else "Unknown"
             )
             if suite_name not in modules_by_suite:
                 modules_by_suite[suite_name] = []
-            modules_by_suite[suite_name].append({
-                "_id": t.get("_id"),
-                "name": t.get("name"),
-            })
+            modules_by_suite[suite_name].append(
+                {
+                    "_id": t.get("_id"),
+                    "name": t.get("name"),
+                }
+            )
 
     result = [
         {"suite": suite_name, "modules": modules}
@@ -117,7 +123,7 @@ def list_modules() -> str:
     return format_response(result)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def get_module_usage(module_id: str) -> str:
     """Find all tests that import a specific module.
 
@@ -137,47 +143,46 @@ def get_module_usage(module_id: str) -> str:
     try:
         module = client.get_test(module_id)
         module_name = module.get("name", "Unknown")
-    except Exception:
+    except GhostInspectorError:
         module_name = "Unknown"
 
-    tests = client.list_tests()
-    importing_tests = []
+    candidates = [t for t in client.list_tests() if t.get("_id") != module_id]
 
-    for t in tests:
-        # Skip the module itself
-        if t.get("_id") == module_id:
-            continue
-
-        # Get full test details to check steps
+    def imports_module(t: dict) -> Optional[dict]:
         try:
             test_detail = client.get_test(t.get("_id"))
-            steps = test_detail.get("steps", [])
-            for step in steps:
-                # Check for importTest command targeting this module
-                if step.get("command") == "importTest" and step.get("target") == module_id:
-                    suite_info = test_detail.get("suite", {})
-                    importing_tests.append({
-                        "_id": t.get("_id"),
-                        "name": t.get("name"),
-                        "suite_id": suite_info.get("_id") if isinstance(suite_info, dict) else None,
-                        "suite_name": suite_info.get("name") if isinstance(suite_info, dict) else None,
-                    })
-                    break
-        except Exception:
-            continue
+        except GhostInspectorError:
+            return None
+        for step in test_detail.get("steps", []):
+            # Check for importTest command targeting this module
+            if step.get("command") == "importTest" and step.get("target") == module_id:
+                suite_info = test_detail.get("suite", {})
+                return {
+                    "_id": t.get("_id"),
+                    "name": t.get("name"),
+                    "suite_id": suite_info.get("_id") if isinstance(suite_info, dict) else None,
+                    "suite_name": suite_info.get("name") if isinstance(suite_info, dict) else None,
+                }
+        return None
 
-    return format_response({
-        "module_id": module_id,
-        "module_name": module_name,
-        "importing_tests_count": len(importing_tests),
-        "importing_tests": importing_tests,
-    })
+    # Every test's steps must be fetched individually; do it a few at a time.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        importing_tests = [r for r in pool.map(imports_module, candidates) if r]
+
+    return format_response(
+        {
+            "module_id": module_id,
+            "module_name": module_name,
+            "importing_tests_count": len(importing_tests),
+            "importing_tests": importing_tests,
+        }
+    )
 
 
 # ==================== Test Tools ====================
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def list_tests() -> str:
     """List all tests in your Ghost Inspector account.
 
@@ -191,7 +196,9 @@ def list_tests() -> str:
         {
             "_id": t.get("_id"),
             "name": t.get("name"),
-            "suite": t.get("suite", {}).get("name") if isinstance(t.get("suite"), dict) else t.get("suite"),
+            "suite": t.get("suite", {}).get("name")
+            if isinstance(t.get("suite"), dict)
+            else t.get("suite"),
             "importOnly": t.get("importOnly", False),
             "passing": t.get("passing"),
             "screenshotComparePassing": t.get("screenshotComparePassing"),
@@ -202,7 +209,7 @@ def list_tests() -> str:
     return format_response(simplified)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def get_test(test_id: str) -> str:
     """Get detailed information about a specific test.
 
@@ -217,7 +224,7 @@ def get_test(test_id: str) -> str:
     return format_response(test)
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def execute_test(
     test_id: str,
     start_url: Optional[str] = None,
@@ -251,7 +258,7 @@ def execute_test(
     return format_response(result)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def list_test_results(test_id: str, count: int = 10, offset: int = 0) -> str:
     """List execution results for a specific test.
 
@@ -281,7 +288,7 @@ def list_test_results(test_id: str, count: int = 10, offset: int = 0) -> str:
     return format_response(simplified)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def get_test_result(result_id: str) -> str:
     """Get detailed information about a specific test result.
 
@@ -296,7 +303,7 @@ def get_test_result(result_id: str) -> str:
     return format_response(result)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CANCEL)
 def cancel_test_result(result_id: str) -> str:
     """Cancel a running test execution.
 
@@ -311,7 +318,7 @@ def cancel_test_result(result_id: str) -> str:
     return format_response(result)
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def duplicate_test(test_id: str) -> str:
     """Duplicate an existing test to create a copy.
 
@@ -326,7 +333,7 @@ def duplicate_test(test_id: str) -> str:
     return format_response(result)
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def execute_on_demand_test(
     org_id: str,
     name: str,
@@ -362,7 +369,7 @@ def execute_on_demand_test(
     try:
         steps_list = json.loads(steps)
     except json.JSONDecodeError as e:
-        return format_response({"error": f"Invalid steps JSON: {e}"})
+        raise GhostInspectorError(f"Invalid steps JSON: {e}") from e
 
     test_definition = {
         "name": name,
@@ -384,7 +391,7 @@ def execute_on_demand_test(
 # ==================== Suite Tools ====================
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def list_suites() -> str:
     """List all test suites in your Ghost Inspector account.
 
@@ -414,7 +421,7 @@ def list_suites() -> str:
     return format_response(simplified)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def get_suite(suite_id: str) -> str:
     """Get detailed information about a specific suite.
 
@@ -429,7 +436,7 @@ def get_suite(suite_id: str) -> str:
     return format_response(suite)
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def execute_suite(
     suite_id: str,
     start_url: Optional[str] = None,
@@ -463,7 +470,7 @@ def execute_suite(
     return format_response(results)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def list_suite_tests(suite_id: str) -> str:
     """List all tests in a specific suite.
 
@@ -491,7 +498,7 @@ def list_suite_tests(suite_id: str) -> str:
     return format_response(simplified)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def list_suite_results(suite_id: str, count: int = 10, offset: int = 0) -> str:
     """List execution results for a specific suite.
 
@@ -521,7 +528,7 @@ def list_suite_results(suite_id: str, count: int = 10, offset: int = 0) -> str:
     return format_response(simplified)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def get_suite_result(result_id: str) -> str:
     """Get detailed information about a specific suite result.
 
@@ -536,7 +543,7 @@ def get_suite_result(result_id: str) -> str:
     return format_response(result)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def list_suite_result_tests(result_id: str) -> str:
     """List all test results within a suite execution.
 
@@ -563,7 +570,7 @@ def list_suite_result_tests(result_id: str) -> str:
     return format_response(simplified)
 
 
-@mcp.tool()
+@mcp.tool(annotations=CANCEL)
 def cancel_suite_result(result_id: str) -> str:
     """Cancel a running suite execution.
 
@@ -578,7 +585,7 @@ def cancel_suite_result(result_id: str) -> str:
     return format_response(result)
 
 
-@mcp.tool()
+@mcp.tool(annotations=WRITE)
 def import_test(
     suite_id: str,
     name: str,
@@ -607,7 +614,7 @@ def import_test(
     try:
         steps_list = json.loads(steps)
     except json.JSONDecodeError as e:
-        return format_response({"error": f"Invalid steps JSON: {e}"})
+        raise GhostInspectorError(f"Invalid steps JSON: {e}") from e
 
     test_definition = {
         "name": name,
@@ -622,7 +629,7 @@ def import_test(
 # ==================== Folder Tools ====================
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def list_folders() -> str:
     """List all folders in your Ghost Inspector account.
 
@@ -641,7 +648,7 @@ def list_folders() -> str:
     return format_response(simplified)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def get_folder(folder_id: str) -> str:
     """Get detailed information about a specific folder.
 
@@ -656,7 +663,7 @@ def get_folder(folder_id: str) -> str:
     return format_response(folder)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def list_folder_suites(folder_id: str) -> str:
     """List all suites in a specific folder.
 
@@ -684,7 +691,7 @@ def list_folder_suites(folder_id: str) -> str:
 # ==================== Organization Tools ====================
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def get_running_tests(org_id: str) -> str:
     """Get currently running tests for an organization.
 
