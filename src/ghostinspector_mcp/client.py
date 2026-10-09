@@ -15,6 +15,11 @@ class GhostInspectorError(ToolError):
     """An anticipated failure whose message is shown to the model."""
 
 
+def _execute_timeout(immediate: bool) -> float:
+    """Only executions that wait for the run to finish need the long timeout."""
+    return DEFAULT_TIMEOUT if immediate else EXECUTE_TIMEOUT
+
+
 class GhostInspectorClient:
     """Client for interacting with the Ghost Inspector API."""
 
@@ -47,21 +52,30 @@ class GhostInspectorClient:
                 timeout=timeout,
             )
         except httpx.TimeoutException as e:
-            raise GhostInspectorError(
-                f"Ghost Inspector did not respond within {timeout:.0f}s. For long runs, "
-                "execute with immediate=True and poll the result instead."
-            ) from e
+            message = f"Ghost Inspector did not respond within {timeout:.0f}s."
+            if timeout == EXECUTE_TIMEOUT:
+                message += " For long runs, execute with immediate=True and poll the result."
+            raise GhostInspectorError(message) from e
         except httpx.HTTPError as e:
             raise GhostInspectorError(f"Could not reach Ghost Inspector: {e!r}") from e
 
+        status = f" ({response.status_code})" if response.status_code >= 400 else ""
         try:
             result = response.json()
         except ValueError:
-            result = {}
+            # e.g. an HTML error page from a proxy; never treat it as a successful result
+            body = (response.text or response.reason_phrase).strip()[:500]
+            raise GhostInspectorError(
+                f"Ghost Inspector returned an unexpected non-JSON response"
+                f" ({response.status_code}): {body}"
+            ) from None
+        if not isinstance(result, dict):
+            raise GhostInspectorError(
+                f"Ghost Inspector returned an unexpected response{status}: {str(result)[:500]}"
+            )
 
         if response.status_code >= 400 or result.get("code") == "ERROR":
             message = result.get("message") or response.text or response.reason_phrase
-            status = f" ({response.status_code})" if response.status_code >= 400 else ""
             raise GhostInspectorError(f"Ghost Inspector API error{status}: {message}")
 
         return result.get("data", result)
@@ -103,7 +117,10 @@ class GhostInspectorClient:
                 params[key] = value
 
         return self._request(
-            "POST", f"tests/{test_id}/execute", params=params, timeout=EXECUTE_TIMEOUT
+            "POST",
+            f"tests/{test_id}/execute",
+            params=params,
+            timeout=_execute_timeout(immediate),
         )
 
     def list_test_results(self, test_id: str, count: int = 10, offset: int = 0) -> list[dict]:
@@ -157,7 +174,7 @@ class GhostInspectorClient:
             "tests/on-demand/execute",
             params=params,
             json_data=test_definition,
-            timeout=EXECUTE_TIMEOUT,
+            timeout=_execute_timeout(immediate),
         )
 
     # ==================== Suites ====================
@@ -197,7 +214,10 @@ class GhostInspectorClient:
                 params[key] = value
 
         return self._request(
-            "POST", f"suites/{suite_id}/execute", params=params, timeout=EXECUTE_TIMEOUT
+            "POST",
+            f"suites/{suite_id}/execute",
+            params=params,
+            timeout=_execute_timeout(immediate),
         )
 
     def list_suite_tests(self, suite_id: str) -> list[dict]:

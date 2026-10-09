@@ -9,6 +9,7 @@ import respx
 
 from ghostinspector_mcp import server
 from ghostinspector_mcp.client import (
+    DEFAULT_TIMEOUT,
     EXECUTE_TIMEOUT,
     GhostInspectorClient,
     GhostInspectorError,
@@ -105,3 +106,25 @@ def test_tools_are_annotated():
     assert tools["execute_test"].read_only_hint is False
     assert tools["execute_test"].destructive_hint is False
     assert tools["cancel_suite_result"].destructive_hint is True
+
+
+@respx.mock
+def test_immediate_execute_uses_default_timeout():
+    route = respx.post(f"{API}/suites/s1/execute").respond(json=ok([]))
+    server.execute_suite("s1", immediate=True)
+    assert route.calls.last.request.extensions["timeout"]["read"] == DEFAULT_TIMEOUT
+
+
+@respx.mock
+def test_timeout_on_quick_call_does_not_suggest_immediate():
+    respx.get(f"{API}/tests/t1").mock(side_effect=httpx.ReadTimeout("slow"))
+    with pytest.raises(GhostInspectorError) as exc:
+        server.get_test("t1")
+    assert "immediate" not in str(exc.value)
+
+
+@respx.mock
+def test_non_json_success_response_is_an_error():
+    respx.get(f"{API}/folders").respond(200, text="<html>Bad gateway</html>")
+    with pytest.raises(GhostInspectorError, match=r"non-JSON response \(200\): <html>Bad gateway"):
+        server.list_folders()
