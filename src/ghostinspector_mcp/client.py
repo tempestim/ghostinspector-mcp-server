@@ -1,7 +1,23 @@
 """Ghost Inspector API client."""
 
-import httpx
 from typing import Any, Optional
+
+import httpx
+from mcp.server.mcpserver.exceptions import ToolError
+
+# Executing a test or suite without immediate=True waits for it to finish, which
+# can take many minutes; everything else should be quick.
+DEFAULT_TIMEOUT = 60.0
+EXECUTE_TIMEOUT = 900.0
+
+
+class GhostInspectorError(ToolError):
+    """An anticipated failure whose message is shown to the model."""
+
+
+def _execute_timeout(immediate: bool) -> float:
+    """Only executions that wait for the run to finish need the long timeout."""
+    return DEFAULT_TIMEOUT if immediate else EXECUTE_TIMEOUT
 
 
 class GhostInspectorClient:
@@ -12,7 +28,7 @@ class GhostInspectorClient:
     def __init__(self, api_key: str):
         """Initialize the client with an API key."""
         self.api_key = api_key
-        self._client = httpx.Client(timeout=60.0)
+        self._client = httpx.Client(timeout=DEFAULT_TIMEOUT)
 
     def _request(
         self,
@@ -20,23 +36,47 @@ class GhostInspectorClient:
         endpoint: str,
         params: Optional[dict] = None,
         json_data: Optional[dict] = None,
+        timeout: float = DEFAULT_TIMEOUT,
     ) -> Any:
         """Make a request to the Ghost Inspector API."""
         url = f"{self.BASE_URL}/{endpoint}"
         params = params or {}
         params["apiKey"] = self.api_key
 
-        response = self._client.request(
-            method=method,
-            url=url,
-            params=params,
-            json=json_data,
-        )
-        response.raise_for_status()
-        result = response.json()
+        try:
+            response = self._client.request(
+                method=method,
+                url=url,
+                params=params,
+                json=json_data,
+                timeout=timeout,
+            )
+        except httpx.TimeoutException as e:
+            message = f"Ghost Inspector did not respond within {timeout:.0f}s."
+            if timeout == EXECUTE_TIMEOUT:
+                message += " For long runs, execute with immediate=True and poll the result."
+            raise GhostInspectorError(message) from e
+        except httpx.HTTPError as e:
+            raise GhostInspectorError(f"Could not reach Ghost Inspector: {e!r}") from e
 
-        if result.get("code") == "ERROR":
-            raise Exception(result.get("message", "Unknown API error"))
+        status = f" ({response.status_code})" if response.status_code >= 400 else ""
+        try:
+            result = response.json()
+        except ValueError:
+            # e.g. an HTML error page from a proxy; never treat it as a successful result
+            body = (response.text or response.reason_phrase).strip()[:500]
+            raise GhostInspectorError(
+                f"Ghost Inspector returned an unexpected non-JSON response"
+                f" ({response.status_code}): {body}"
+            ) from None
+        if not isinstance(result, dict):
+            raise GhostInspectorError(
+                f"Ghost Inspector returned an unexpected response{status}: {str(result)[:500]}"
+            )
+
+        if response.status_code >= 400 or result.get("code") == "ERROR":
+            message = result.get("message") or response.text or response.reason_phrase
+            raise GhostInspectorError(f"Ghost Inspector API error{status}: {message}")
 
         return result.get("data", result)
 
@@ -76,11 +116,14 @@ class GhostInspectorClient:
             for key, value in variables.items():
                 params[key] = value
 
-        return self._request("POST", f"tests/{test_id}/execute", params=params)
+        return self._request(
+            "POST",
+            f"tests/{test_id}/execute",
+            params=params,
+            timeout=_execute_timeout(immediate),
+        )
 
-    def list_test_results(
-        self, test_id: str, count: int = 10, offset: int = 0
-    ) -> list[dict]:
+    def list_test_results(self, test_id: str, count: int = 10, offset: int = 0) -> list[dict]:
         """List results for a specific test."""
         return self._request(
             "GET",
@@ -127,7 +170,11 @@ class GhostInspectorClient:
             params["immediate"] = "true"
 
         return self._request(
-            "POST", "tests/on-demand/execute", params=params, json_data=test_definition
+            "POST",
+            "tests/on-demand/execute",
+            params=params,
+            json_data=test_definition,
+            timeout=_execute_timeout(immediate),
         )
 
     # ==================== Suites ====================
@@ -166,15 +213,18 @@ class GhostInspectorClient:
             for key, value in variables.items():
                 params[key] = value
 
-        return self._request("POST", f"suites/{suite_id}/execute", params=params)
+        return self._request(
+            "POST",
+            f"suites/{suite_id}/execute",
+            params=params,
+            timeout=_execute_timeout(immediate),
+        )
 
     def list_suite_tests(self, suite_id: str) -> list[dict]:
         """List all tests in a suite."""
         return self._request("GET", f"suites/{suite_id}/tests")
 
-    def list_suite_results(
-        self, suite_id: str, count: int = 10, offset: int = 0
-    ) -> list[dict]:
+    def list_suite_results(self, suite_id: str, count: int = 10, offset: int = 0) -> list[dict]:
         """List results for a specific suite."""
         return self._request(
             "GET",
